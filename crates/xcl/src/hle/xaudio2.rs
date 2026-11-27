@@ -1179,10 +1179,13 @@ unsafe extern "system" fn voice_discontinuity(this: *mut c_void) -> HRESULT {
     let Some(revision) = revision else { return native(this) };
     let Some(get_state) = original(this, VOICE_GET_STATE) else { return native(this) };
     let get_state: GetStateFn = std::mem::transmute(get_state);
+    // Ask the native voice first. A pre-call queue snapshot can go stale if playback drains
+    // the last buffer before Discontinuity runs; then S_OK still means "nothing marked" and
+    // the Opus decoder must keep its stream (#2942 / Gevroska).
+    let hr = native(this);
     let mut queue: XAudio2VoiceState = std::mem::zeroed();
-    // The native call can only mark a buffer already in the queue.
     get_state(this, &mut queue, XAUDIO2_VOICE_NOSAMPLESPLAYED);
-    complete_discontinuity(&state, revision, queue.buffers_queued != 0, native(this))
+    complete_discontinuity(&state, revision, queue.buffers_queued != 0, hr)
 }
 
 unsafe extern "system" fn get_state(this: *mut c_void, state_out: *mut XAudio2VoiceState, flags: u32) {
@@ -1424,6 +1427,19 @@ mod tests {
             assert_eq!(complete_discontinuity(&state, revision, true, hr), hr);
             assert_eq!(fixture.submit(packet, 0, 3).len() / 2, 960, "hr={hr:#x}, advanced={advanced}");
         }
+    }
+
+    #[test]
+    fn opus_discontinuity_ignores_a_stale_queued_snapshot() {
+        // Playback can empty the voice between a pre-call GetState and Discontinuity.
+        // complete_discontinuity must follow the post-call queue: queued=false keeps history.
+        let Some(fixture) = OpusBoundaryVoice::new() else { return };
+        let packet = opus::tests::MONO_HYBRID_20MS[0];
+        assert_eq!(fixture.submit(packet, 0, 1).len() / 2, 840);
+        let state = Arc::clone(&DECODED_VOICES.lock().unwrap().as_ref().unwrap().get(&(fixture.voice as usize)).unwrap().state);
+        let revision = state.decoder.lock().unwrap().opus_revision().unwrap();
+        assert_eq!(complete_discontinuity(&state, revision, false, S_OK), S_OK);
+        assert_eq!(fixture.submit(packet, 0, 2).len() / 2, 960, "stale queued=true must not reset Opus");
     }
 
     fn xma2(channels: u16, rate: u32, samples: u32, bpb: u32, blocks: u16) -> Xma2WaveFormatEx {
